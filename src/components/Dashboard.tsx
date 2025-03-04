@@ -8,6 +8,7 @@ const StatCard = lazy(() => import('./StatCard'));
 const TimeSeriesChart = lazy(() => import('./TimeSeriesChart'));
 const HourHistogramChart = lazy(() => import('./HourHistogramChart'));
 const PullRequestList = lazy(() => import('./PullRequestList'));
+const CommentList = lazy(() => import('./CommentList'));
 
 interface TabPanelProps {
   children?: React.ReactNode;
@@ -50,7 +51,8 @@ const DashboardComponent: FC = () => {
     showBlockedUsers,
     setShowBlockedUsers,
     pullRequestsByWeek,
-    setCurrentTab
+    setCurrentTab,
+    commentsByUser
   } = useGitHubData();
 
   const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
@@ -106,6 +108,7 @@ const DashboardComponent: FC = () => {
           <Tab label="Gráficos por Tempo" />
           <Tab label="Gráficos por Usuário" />
           <Tab label="Lista de Pull Requests" />
+          <Tab label="Comentários por Usuário" />
         </Tabs>
       </Box>
       
@@ -222,6 +225,16 @@ const DashboardComponent: FC = () => {
           </Box>
         }>
           <PullRequestList pullRequestsByWeek={pullRequestsByWeek} />
+        </Suspense>
+      </TabPanel>
+      
+      <TabPanel value={tabValue} index={3}>
+        <Suspense fallback={
+          <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
+            <CircularProgress />
+          </Box>
+        }>
+          <CommentList commentsByUser={commentsByUser} />
         </Suspense>
       </TabPanel>
     </Box>

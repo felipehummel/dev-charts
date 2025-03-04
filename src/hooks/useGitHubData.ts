@@ -1,19 +1,10 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { GitHubData, FilterState, ChartData, StatData, TimeSeriesData, DailyUserData } from '../types';
-
-// Lista de usuários bloqueados (bots e outros usuários indesejados)
-const BLOCKED_USERS = [
-  // Padrão para bots (será usado para filtrar dinamicamente)
-  '[bot]'
-];
+import { GitHubData, FilterState, TimeSeriesData, DailyUserData } from '../types';
 
 // Função para verificar se um usuário deve ser bloqueado
 const shouldBlockUser = (username: string): boolean => {
   // Verificar se o nome de usuário termina com [bot]
-  if (username.endsWith('[bot]')) return true;
-
-  // Verificar se o usuário está na lista de bloqueados
-  return BLOCKED_USERS.includes(username);
+  return username.endsWith('[bot]');
 };
 
 export const useGitHubData = () => {
@@ -27,12 +18,15 @@ export const useGitHubData = () => {
   const [showBlockedUsers, setShowBlockedUsers] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<number>(0);
 
+  // Novo estado para armazenar comentários por usuário
+  const [commentsByUser, setCommentsByUser] = useState<any[]>([]);
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         setLoading(true);
         // Buscar o arquivo JSON mais recente na pasta data
-        const response = await fetch('/data/github-data-2025-03-04T18-08-20-031Z.json');
+        const response = await fetch('/data/github-data-2025-03-04T20-17-50-610Z.json');
         if (!response.ok) {
           throw new Error('Falha ao carregar os dados');
         }
@@ -766,6 +760,81 @@ export const useGitHubData = () => {
     );
   }, [filteredData, activeTab]);
 
+  // Processar comentários por usuário
+  useEffect(() => {
+    if (!filteredData || activeTab !== 3) return;
+
+    const userComments: Record<string, {
+      user: string;
+      avatar_url: string;
+      comments: Array<{
+        id: number;
+        body: string | null;
+        user: {
+          login: string;
+          avatar_url: string;
+        };
+        created_at: string;
+        html_url: string;
+        pr_number: number;
+        pr_title: string;
+        pr_html_url: string;
+        repository: string;
+      }>;
+    }> = {};
+
+    Object.values(filteredData.repositories).forEach(repo => {
+      repo.pull_requests.forEach(pr => {
+        pr.comments.forEach(comment => {
+          if (comment.user && comment.user.login) {
+            const user = comment.user.login;
+
+            // Verificar se o usuário está bloqueado (bot)
+            if (!showBlockedUsers && shouldBlockUser(user)) {
+              return;
+            }
+
+            if (!userComments[user]) {
+              userComments[user] = {
+                user,
+                avatar_url: comment.user.avatar_url,
+                comments: []
+              };
+            }
+
+            userComments[user].comments.push({
+              id: comment.id,
+              body: comment.body,
+              user: {
+                login: comment.user.login,
+                avatar_url: comment.user.avatar_url
+              },
+              created_at: comment.created_at,
+              html_url: comment.html_url,
+              pr_number: pr.number,
+              pr_title: pr.title,
+              pr_html_url: pr.html_url,
+              repository: repo.repository.name
+            });
+          }
+        });
+      });
+    });
+
+    // Ordenar usuários por número de comentários (decrescente)
+    const sortedCommentsByUser = Object.values(userComments)
+      .sort((a, b) => b.comments.length - a.comments.length)
+      .map(userGroup => ({
+        ...userGroup,
+        // Ordenar comentários por data (mais recentes primeiro)
+        comments: userGroup.comments.sort((a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        )
+      }));
+
+    setCommentsByUser(sortedCommentsByUser);
+  }, [filteredData, activeTab, showBlockedUsers]);
+
   // Função para atualizar a aba ativa
   const setCurrentTab = (tab: number) => {
     setActiveTab(tab);
@@ -799,6 +868,7 @@ export const useGitHubData = () => {
       rejectedReviews: rejectedReviewsTimeStats,
       comments: commentsTimeStats,
       commitsByHour: commitsByHourStats
-    }
+    },
+    commentsByUser
   };
 }; 

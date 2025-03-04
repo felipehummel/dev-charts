@@ -3,8 +3,7 @@ import {
   Box, 
   Card, 
   CardContent, 
-  Typography, 
-  useTheme 
+  Typography
 } from '@mui/material';
 import { 
   BarChart, 

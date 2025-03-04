@@ -150,6 +150,7 @@ interface Repository {
   topics: string[];
   visibility: 'public' | 'private';
   default_branch: string;
+  pull_requests: PullRequest[];
 }
 
 interface GitHubData {
@@ -215,7 +216,7 @@ async function main() {
     const startDateString = startDate.toISOString();
 
     // Busca todos os repositórios da organização
-    const repositories = await fetchAllRepositories(octokit, org);
+    const repositories = await fetchRepositories(octokit, org);
     console.log(`Encontrados ${repositories.length} repositórios.`);
 
     // Inicializa o objeto de dados
@@ -244,55 +245,43 @@ async function main() {
       console.log(`Processando repositório: ${repo.name}`);
 
       // Busca todos os PRs do repositório desde a data de início
-      const pullRequests = await fetchAllPullRequests(octokit, org, repo.name, startDateString);
-      console.log(`  Encontrados ${pullRequests.length} PRs desde ${new Date(startDateString).toLocaleDateString()}`);
+      const pullRequestsRaw = await fetchAllPullRequests(octokit, org, repo.name, startDateString);
+      console.log(`  Encontrados ${pullRequestsRaw.length} PRs desde ${new Date(startDateString).toLocaleDateString()}`);
 
-      if (pullRequests.length === 0) {
+      if (pullRequestsRaw.length === 0) {
         continue;
       }
 
-      // Para cada PR, busca commits, reviews, comentários e detalhes
-      const detailedPRs: PullRequest[] = [];
+      // Formata os PRs em lotes paralelos
+      console.log(`  Formatando ${pullRequestsRaw.length} PRs...`);
+      const pullRequests = await processInBatches(
+        pullRequestsRaw,
+        10,
+        (pr) => formatPullRequest(octokit, org, repo.name, pr)
+      );
 
-      for (const pr of pullRequests) {
-        console.log(`  Processando PR #${pr.number}: ${pr.title}`);
-
-        // Busca detalhes completos do PR
-        const detailedPR = await fetchPullRequestDetails(octokit, org, repo.name, pr.number);
-
-        // Busca commits do PR
-        const commits = await fetchPullRequestCommits(octokit, org, repo.name, pr.number);
-        detailedPR.commits = commits;
-
-        // Busca reviews do PR
-        const reviews = await fetchPullRequestReviews(octokit, org, repo.name, pr.number);
-        detailedPR.reviews = reviews;
-
-        // Busca comentários do PR
-        const comments = await fetchPullRequestComments(octokit, org, repo.name, pr.number);
-        detailedPR.comments = comments;
-
-        // Busca solicitações de revisão
-        const reviewRequests = await fetchReviewRequests(octokit, org, repo.name, pr.number);
-        detailedPR.review_requests = reviewRequests;
-
-        detailedPRs.push(detailedPR);
-
-        // Atualiza estatísticas
-        data.summary.total_commits += commits.length;
-        data.summary.total_comments += comments.length;
-        data.summary.total_reviews += reviews.length;
-        data.summary.total_review_requests += reviewRequests.length;
-        data.summary.total_additions += detailedPR.additions || 0;
-        data.summary.total_deletions += detailedPR.deletions || 0;
-        data.summary.total_changed_files += detailedPR.changed_files || 0;
-      }
+      // Processa os PRs em lotes paralelos (5 PRs por vez)
+      console.log(`  Processando detalhes de ${pullRequests.length} PRs...`);
+      const detailedPRs = await processInBatches(
+        pullRequests,
+        5,
+        (pr) => processPR(octokit, org, repo.name, pr)
+      );
 
       // Atualiza o objeto de dados com os PRs deste repositório
       data.repositories[repo.name] = {
         repository: repo,
         pull_requests: detailedPRs
       };
+
+      // Atualiza estatísticas
+      data.summary.total_commits += detailedPRs.reduce((total, pr) => total + pr.commits.length, 0);
+      data.summary.total_comments += detailedPRs.reduce((total, pr) => total + pr.comments.length, 0);
+      data.summary.total_reviews += detailedPRs.reduce((total, pr) => total + pr.reviews.length, 0);
+      data.summary.total_review_requests += detailedPRs.reduce((total, pr) => total + pr.review_requests.length, 0);
+      data.summary.total_additions += detailedPRs.reduce((total, pr) => total + (pr.additions || 0), 0);
+      data.summary.total_deletions += detailedPRs.reduce((total, pr) => total + (pr.deletions || 0), 0);
+      data.summary.total_changed_files += detailedPRs.reduce((total, pr) => total + pr.changed_files, 0);
 
       // Atualiza estatísticas gerais
       data.summary.total_pull_requests += detailedPRs.length;
@@ -335,300 +324,235 @@ async function main() {
   }
 }
 
-// Função para buscar todos os repositórios privados de uma organização
-async function fetchAllRepositories(octokit: Octokit, org: string): Promise<Repository[]> {
+// Função para buscar todos os repositórios da organização
+async function fetchRepositories(octokit: Octokit, org: string): Promise<Repository[]> {
+  console.log(`Buscando repositórios da organização ${org}...`);
+
   const repositories: Repository[] = [];
   let page = 1;
+  const perPage = 100;
   let hasMorePages = true;
-  let totalRepos = 0;
-  let privateRepos = 0;
+  const pagePromises: Promise<any[]>[] = [];
 
-  console.log(`Buscando repositórios para a organização: ${org}`);
-
+  // Primeiro, descobrimos quantas páginas existem
   while (hasMorePages) {
     try {
-      console.log(`Buscando página ${page} de repositórios...`);
-      const response = await octokit.request('GET /orgs/{org}/repos', {
+      const response = await octokit.rest.repos.listForOrg({
         org,
         type: 'all',
-        per_page: 100,
+        per_page: perPage,
         page
       });
 
-      console.log(`Encontrados ${response.data.length} repositórios na página ${page}`);
-      totalRepos += response.data.length;
-
       if (response.data.length === 0) {
         hasMorePages = false;
-      } else {
-        // Conta quantos repositórios privados existem nesta página
-        const privateReposInPage = response.data.filter(repo => repo.private === true).length;
-        privateRepos += privateReposInPage;
-        console.log(`Repositórios privados nesta página: ${privateReposInPage}`);
-
-        // Imprime informações sobre cada repositório para depuração
-        response.data.forEach((repo, index) => {
-          console.log(`Repo ${index + 1}: ${repo.name}, Privado: ${repo.private}, Visibilidade: ${repo.visibility}`);
-        });
-
-        // Filtra apenas repositórios privados e converte para o formato Repository
-        const formattedRepos = response.data
-          .filter(repo => repo.private === true) // Filtra apenas repositórios privados
-          .map(repo => {
-            // Formata a licença para o formato correto
-            let formattedLicense: { key: string; name: string; spdx_id: string; url: string; } | null = null;
-            if (repo.license) {
-              formattedLicense = {
-                key: repo.license.key || '',
-                name: repo.license.name || '',
-                spdx_id: repo.license.spdx_id || '',
-                url: repo.license.url || ''
-              };
-            }
-
-            // Garante que a visibilidade seja 'private' ou 'public'
-            const visibility: 'public' | 'private' = 'private';
-
-            return {
-              id: repo.id,
-              name: repo.name,
-              full_name: repo.full_name,
-              html_url: repo.html_url,
-              description: repo.description,
-              fork: repo.fork,
-              created_at: repo.created_at || '',
-              updated_at: repo.updated_at || '',
-              pushed_at: repo.pushed_at || '',
-              homepage: repo.homepage as string | null,
-              size: repo.size || 0, // Garante que size seja um número
-              stargazers_count: repo.stargazers_count || 0, // Garante que seja um número
-              watchers_count: repo.watchers_count || 0, // Garante que seja um número
-              language: repo.language as string | null, // Garante que seja string | null
-              forks_count: repo.forks_count || 0, // Garante que seja um número
-              archived: repo.archived || false, // Garante que seja um booleano
-              disabled: repo.disabled || false, // Garante que seja um booleano
-              open_issues_count: repo.open_issues_count || 0, // Garante que seja um número
-              license: formattedLicense,
-              topics: repo.topics || [],
-              visibility: visibility, // Forçamos como privado já que filtramos apenas privados
-              default_branch: repo.default_branch || 'main'
-            };
-          });
-
-        repositories.push(...formattedRepos);
-        page++;
+        break;
       }
+
+      // Adiciona a promessa para buscar esta página
+      pagePromises.push(Promise.resolve(response.data));
+
+      page++;
     } catch (error) {
-      console.error('Erro ao buscar repositórios:', error);
+      console.error(`Erro ao buscar repositórios para ${org}:`, error);
       hasMorePages = false;
     }
   }
 
-  console.log(`Total de repositórios encontrados: ${totalRepos}`);
-  console.log(`Total de repositórios privados: ${privateRepos}`);
-  console.log(`Repositórios privados formatados: ${repositories.length}`);
+  // Agora, processamos todas as páginas em paralelo
+  const results = await Promise.all(pagePromises);
 
-  // Se não encontrou nenhum repositório privado, vamos tentar buscar todos os repositórios
-  if (repositories.length === 0 && totalRepos > 0) {
-    console.log("Não foram encontrados repositórios privados. Tentando buscar todos os repositórios...");
-
-    // Reinicia a busca para todos os repositórios
-    page = 1;
-    hasMorePages = true;
-
-    while (hasMorePages) {
-      try {
-        const response = await octokit.request('GET /orgs/{org}/repos', {
-          org,
-          type: 'all',
-          per_page: 100,
-          page
-        });
-
-        if (response.data.length === 0) {
-          hasMorePages = false;
-        } else {
-          // Converte todos os repositórios para o formato Repository
-          const formattedRepos = response.data.map(repo => {
-            // Formata a licença para o formato correto
-            let formattedLicense: { key: string; name: string; spdx_id: string; url: string; } | null = null;
-            if (repo.license) {
-              formattedLicense = {
-                key: repo.license.key || '',
-                name: repo.license.name || '',
-                spdx_id: repo.license.spdx_id || '',
-                url: repo.license.url || ''
-              };
-            }
-
-            // Determina a visibilidade
-            const visibility: 'public' | 'private' = repo.private ? 'private' : 'public';
-
-            return {
-              id: repo.id,
-              name: repo.name,
-              full_name: repo.full_name,
-              html_url: repo.html_url,
-              description: repo.description,
-              fork: repo.fork,
-              created_at: repo.created_at || '',
-              updated_at: repo.updated_at || '',
-              pushed_at: repo.pushed_at || '',
-              homepage: repo.homepage as string | null,
-              size: repo.size || 0,
-              stargazers_count: repo.stargazers_count || 0,
-              watchers_count: repo.watchers_count || 0,
-              language: repo.language as string | null,
-              forks_count: repo.forks_count || 0,
-              archived: repo.archived || false,
-              disabled: repo.disabled || false,
-              open_issues_count: repo.open_issues_count || 0,
-              license: formattedLicense,
-              topics: repo.topics || [],
-              visibility: visibility,
-              default_branch: repo.default_branch || 'main'
-            };
-          });
-
-          repositories.push(...formattedRepos);
-          page++;
-        }
-      } catch (error) {
-        console.error('Erro ao buscar todos os repositórios:', error);
-        hasMorePages = false;
+  // Processamos os resultados
+  results.forEach(pageData => {
+    for (const repo of pageData) {
+      // Formata a licença para o formato correto
+      let formattedLicense: { key: string; name: string; spdx_id: string; url: string; } | null = null;
+      if (repo.license) {
+        formattedLicense = {
+          key: repo.license.key || '',
+          name: repo.license.name || '',
+          spdx_id: repo.license.spdx_id || '',
+          url: repo.license.url || ''
+        };
       }
-    }
 
-    console.log(`Total de repositórios (incluindo públicos) formatados: ${repositories.length}`);
-  }
+      repositories.push({
+        id: repo.id,
+        name: repo.name,
+        full_name: repo.full_name,
+        description: repo.description || null,
+        html_url: repo.html_url,
+        language: repo.language || null,
+        created_at: repo.created_at,
+        updated_at: repo.updated_at,
+        pushed_at: repo.pushed_at,
+        size: repo.size,
+        stargazers_count: repo.stargazers_count,
+        watchers_count: repo.watchers_count,
+        forks_count: repo.forks_count,
+        open_issues_count: repo.open_issues_count,
+        default_branch: repo.default_branch,
+        archived: repo.archived,
+        disabled: repo.disabled,
+        visibility: repo.visibility || 'public',
+        fork: repo.fork || false,
+        homepage: repo.homepage || null,
+        license: formattedLicense,
+        topics: repo.topics || [],
+        pull_requests: []
+      });
+    }
+  });
 
   return repositories;
 }
 
 // Função para buscar todos os PRs de um repositório desde uma data específica
-async function fetchAllPullRequests(octokit: Octokit, owner: string, repo: string, since: string): Promise<PullRequest[]> {
-  const pullRequests: PullRequest[] = [];
+async function fetchAllPullRequests(octokit: Octokit, owner: string, repo: string, since: string): Promise<any[]> {
+  const allPullRequests: any[] = [];
   let page = 1;
+  const perPage = 100;
   let hasMorePages = true;
+  const pagePromises: Promise<any[]>[] = [];
 
+  // Primeiro, descobrimos quantas páginas existem
   while (hasMorePages) {
-    const response = await octokit.request('GET /repos/{owner}/{repo}/pulls', {
-      owner,
-      repo,
-      state: 'all',
-      sort: 'updated',
-      direction: 'desc',
-      per_page: 100,
-      page
-    });
+    try {
+      const response = await octokit.rest.pulls.list({
+        owner,
+        repo,
+        state: 'all',
+        sort: 'created',
+        direction: 'desc',
+        per_page: perPage,
+        page
+      });
 
-    if (response.data.length === 0) {
-      hasMorePages = false;
-    } else {
-      // Filtra PRs que foram atualizados após a data de início
-      const filteredPRs = response.data.filter(pr => new Date(pr.updated_at) >= new Date(since));
-
-      if (filteredPRs.length < response.data.length) {
-        // Se algum PR foi filtrado, significa que chegamos aos PRs mais antigos que o período desejado
+      // Se não há mais PRs ou chegamos a PRs anteriores à data de início, paramos
+      if (response.data.length === 0) {
         hasMorePages = false;
+        break;
       }
 
-      // Formata os PRs para o tipo PullRequest
-      for (const pr of filteredPRs) {
-        // Busca detalhes adicionais do PR para obter additions, deletions e changed_files
-        let additions = 0;
-        let deletions = 0;
-        let changed_files = 0;
-
-        try {
-          // Busca detalhes completos do PR para obter estatísticas
-          const detailedPR = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-            owner,
-            repo,
-            pull_number: pr.number
-          });
-
-          // Extrai as estatísticas se disponíveis
-          additions = detailedPR.data.additions || 0;
-          deletions = detailedPR.data.deletions || 0;
-          changed_files = detailedPR.data.changed_files || 0;
-        } catch (error) {
-          console.warn(`Não foi possível obter estatísticas para o PR #${pr.number}`);
-        }
-
-        const formattedPR: PullRequest = {
-          id: pr.id,
-          number: pr.number,
-          title: pr.title,
-          user: {
-            login: pr.user?.login || 'unknown',
-            id: pr.user?.id || 0,
-            avatar_url: pr.user?.avatar_url || '',
-            html_url: pr.user?.html_url || ''
-          },
-          state: pr.state as 'open' | 'closed',
-          created_at: pr.created_at,
-          updated_at: pr.updated_at,
-          closed_at: pr.closed_at,
-          merged_at: pr.merged_at,
-          merge_commit_sha: pr.merge_commit_sha,
-          assignees: (pr.assignees || []).map(assignee => ({
-            login: assignee.login,
-            id: assignee.id,
-            avatar_url: assignee.avatar_url,
-            html_url: assignee.html_url
-          })),
-          requested_reviewers: (pr.requested_reviewers || []).map(reviewer => ({
-            login: reviewer.login,
-            id: reviewer.id,
-            avatar_url: reviewer.avatar_url,
-            html_url: reviewer.html_url
-          })),
-          labels: (pr.labels || []).map(label => ({
-            id: typeof label.id === 'number' ? label.id : 0,
-            name: label.name,
-            color: label.color || '',
-            description: label.description || ''
-          })),
-          draft: pr.draft || false,
-          head: {
-            ref: pr.head.ref,
-            sha: pr.head.sha,
-            repo: {
-              id: pr.head.repo?.id || 0,
-              name: pr.head.repo?.name || '',
-              full_name: pr.head.repo?.full_name || '',
-              html_url: pr.head.repo?.html_url || ''
-            }
-          },
-          base: {
-            ref: pr.base.ref,
-            sha: pr.base.sha,
-            repo: {
-              id: pr.base.repo?.id || 0,
-              name: pr.base.repo?.name || '',
-              full_name: pr.base.repo?.full_name || '',
-              html_url: pr.base.repo?.html_url || ''
-            }
-          },
-          html_url: pr.html_url,
-          commits: [],
-          reviews: [],
-          review_requests: [],
-          comments: [],
-          additions: additions,
-          deletions: deletions,
-          changed_files: changed_files
-        };
-
-        pullRequests.push(formattedPR);
+      // Verifica se o último PR da página é anterior à data de início
+      const lastPRDate = new Date(response.data[response.data.length - 1].created_at);
+      if (lastPRDate < new Date(since)) {
+        // Adiciona apenas os PRs que são posteriores à data de início
+        const filteredPRs = response.data.filter(pr => new Date(pr.created_at) >= new Date(since));
+        allPullRequests.push(...filteredPRs);
+        hasMorePages = false;
+        break;
       }
+
+      // Adiciona a promessa para buscar esta página
+      pagePromises.push(Promise.resolve(response.data));
 
       page++;
+    } catch (error) {
+      console.error(`Erro ao buscar PRs para ${owner}/${repo}:`, error);
+      hasMorePages = false;
     }
   }
 
-  return pullRequests;
+  // Agora, processamos todas as páginas em paralelo
+  const results = await Promise.all(pagePromises);
+
+  // Filtramos os resultados para incluir apenas PRs após a data de início
+  results.forEach(pageData => {
+    const filteredPRs = pageData.filter(pr => new Date(pr.created_at) >= new Date(since));
+    allPullRequests.push(...filteredPRs);
+  });
+
+  return allPullRequests;
+}
+
+// Função para formatar um PR da API para o formato usado no JSON
+async function formatPullRequest(octokit: Octokit, owner: string, repo: string, pr: any): Promise<PullRequest> {
+  // Busca detalhes adicionais do PR para obter additions, deletions e changed_files
+  let additions = 0;
+  let deletions = 0;
+  let changed_files = 0;
+
+  try {
+    // Busca detalhes completos do PR para obter estatísticas
+    const detailedPR = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: pr.number
+    });
+
+    // Extrai as estatísticas se disponíveis
+    additions = detailedPR.data.additions || 0;
+    deletions = detailedPR.data.deletions || 0;
+    changed_files = detailedPR.data.changed_files || 0;
+  } catch (error) {
+    console.warn(`Não foi possível obter estatísticas para o PR #${pr.number}`);
+  }
+
+  return {
+    id: pr.id,
+    number: pr.number,
+    title: pr.title,
+    user: {
+      login: pr.user?.login || 'unknown',
+      id: pr.user?.id || 0,
+      avatar_url: pr.user?.avatar_url || '',
+      html_url: pr.user?.html_url || ''
+    },
+    state: pr.state as 'open' | 'closed',
+    created_at: pr.created_at,
+    updated_at: pr.updated_at,
+    closed_at: pr.closed_at,
+    merged_at: pr.merged_at,
+    merge_commit_sha: pr.merge_commit_sha,
+    assignees: (pr.assignees || []).map(assignee => ({
+      login: assignee.login,
+      id: assignee.id,
+      avatar_url: assignee.avatar_url,
+      html_url: assignee.html_url
+    })),
+    requested_reviewers: (pr.requested_reviewers || []).map(reviewer => ({
+      login: reviewer.login,
+      id: reviewer.id,
+      avatar_url: reviewer.avatar_url,
+      html_url: reviewer.html_url
+    })),
+    labels: (pr.labels || []).map(label => ({
+      id: typeof label.id === 'number' ? label.id : 0,
+      name: label.name,
+      color: label.color || '',
+      description: label.description || ''
+    })),
+    draft: pr.draft || false,
+    head: {
+      ref: pr.head.ref,
+      sha: pr.head.sha,
+      repo: {
+        id: pr.head.repo?.id || 0,
+        name: pr.head.repo?.name || '',
+        full_name: pr.head.repo?.full_name || '',
+        html_url: pr.head.repo?.html_url || ''
+      }
+    },
+    base: {
+      ref: pr.base.ref,
+      sha: pr.base.sha,
+      repo: {
+        id: pr.base.repo?.id || 0,
+        name: pr.base.repo?.name || '',
+        full_name: pr.base.repo?.full_name || '',
+        html_url: pr.base.repo?.html_url || ''
+      }
+    },
+    html_url: pr.html_url,
+    commits: [],
+    reviews: [],
+    review_requests: [],
+    comments: [],
+    additions: additions,
+    deletions: deletions,
+    changed_files: changed_files
+  };
 }
 
 // Função para buscar detalhes de um PR específico
@@ -975,6 +899,47 @@ async function fetchReviewRequests(octokit: Octokit, owner: string, repo: string
     console.warn(`Não foi possível obter solicitações de revisão para o PR #${pull_number}`);
     return [];
   }
+}
+
+// Função para processar um PR em paralelo
+async function processPR(octokit: Octokit, org: string, repo: string, pr: any): Promise<PullRequest> {
+  console.log(`  Processando PR #${pr.number}: ${pr.title}`);
+
+  // Busca detalhes completos do PR
+  const detailedPR = await fetchPullRequestDetails(octokit, org, repo, pr.number);
+
+  // Busca todas as informações do PR em paralelo
+  const [commits, reviews, comments, reviewRequests] = await Promise.all([
+    fetchPullRequestCommits(octokit, org, repo, pr.number),
+    fetchPullRequestReviews(octokit, org, repo, pr.number),
+    fetchPullRequestComments(octokit, org, repo, pr.number),
+    fetchReviewRequests(octokit, org, repo, pr.number)
+  ]);
+
+  // Atribui os resultados ao PR
+  detailedPR.commits = commits;
+  detailedPR.reviews = reviews;
+  detailedPR.comments = comments;
+  detailedPR.review_requests = reviewRequests;
+
+  return detailedPR;
+}
+
+// Função para processar PRs em lotes paralelos
+async function processInBatches<T, R>(items: T[], batchSize: number, processFunction: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = [];
+
+  // Processa os itens em lotes
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    console.log(`  Processando lote ${i / batchSize + 1} de ${Math.ceil(items.length / batchSize)} (${batch.length} itens)`);
+
+    // Processa o lote atual em paralelo
+    const batchResults = await Promise.all(batch.map(processFunction));
+    results.push(...batchResults);
+  }
+
+  return results;
 }
 
 // Executa a função principal
